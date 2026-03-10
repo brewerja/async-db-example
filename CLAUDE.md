@@ -8,9 +8,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 uv sync
 
-# Run the OpenSearch standalone example
-uv run python opensearch_example.py
-
 # Start the FastAPI server (with auto-reload)
 uv run uvicorn api:app --port 8000 --reload
 
@@ -36,17 +33,18 @@ Connection strings are hardcoded in each file (`DB_URL`, `OS_HOST`).
 
 ## Architecture
 
-Two entry points, sharing the same Postgres schema (`team` and `hero` tables):
-
-- **`opensearch_example.py`** — standalone async script demonstrating the full opensearch-py async client (bulk indexing, get, term/range queries, aggregations, update, count). Uses a `movies` index unrelated to the API.
-- **`api.py`** — FastAPI app combining both: Postgres is the source of truth, OpenSearch is kept in sync on every hero write.
+The entire app lives in **`api.py`** — a FastAPI service with Postgres as source of truth and OpenSearch kept in sync on every hero write.
 
 ### Key patterns in `api.py`
 
 - **Lifespan**: `create_all` (Postgres) and index creation (OpenSearch) run on startup; connections are disposed on shutdown
 - **Session dependency**: `get_session()` yields one `AsyncSession` per request via `async_sessionmaker`
-- **OS sync**: every `POST`/`PATCH`/`DELETE /heroes` call writes to Postgres first, then calls `_os_index()`/`_os_delete()`
-- **Search**: `GET /search?q=` runs a `multi_match` over `name` and `secret_name` fields in OpenSearch — heroes only appear in search results if they were created through the API
+- **OS sync**: every write (`POST`, `POST /bulk`, `PATCH`, `DELETE`) writes to Postgres first, then syncs to OpenSearch via `_os_index()` / `_os_bulk_index()` / `_os_delete()`
+- **Bulk create**: `POST /heroes/bulk` uses `session.add_all()` + `session.flush()` (to populate IDs before commit) then OS `bulk()`
+- **Search**: `GET /search` builds a bool query — `multi_match` on name/secret_name in `must`, optional `term` (team_id) and `range` (age) in `filter`
+- **Aggregation**: `GET /stats` uses a `terms` bucket on `team_id` with an `avg` sub-aggregation on `age`
+- **Count**: `GET /heroes/count` uses `os_client.count()`
+- Heroes only appear in OpenSearch if created through the API
 
 ### Typing notes
 

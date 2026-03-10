@@ -2,23 +2,26 @@
 FastAPI app combining async psycopg v3 + SQLModel (Postgres) with opensearch-py (OpenSearch).
 
 Endpoints:
-  POST   /teams              create a team
-  GET    /teams              list all teams
+  POST   /teams                    create a team
+  GET    /teams                    list all teams
 
-  POST   /heroes             create a hero (written to Postgres + indexed in OpenSearch)
-  GET    /heroes             list all heroes
-  GET    /heroes/{id}        get one hero
-  PATCH  /heroes/{id}        update a hero (synced to OpenSearch)
-  DELETE /heroes/{id}        delete a hero (removed from OpenSearch)
+  POST   /heroes                   create a hero (written to Postgres + indexed in OpenSearch)
+  POST   /heroes/bulk              bulk-create heroes (add_all + flush + OS bulk)
+  GET    /heroes                   list all heroes
+  GET    /heroes/count             count indexed heroes via OpenSearch
+  GET    /heroes/{id}              get one hero
+  PATCH  /heroes/{id}              update a hero (synced to OpenSearch)
+  DELETE /heroes/{id}              delete a hero (removed from OpenSearch)
 
-  GET    /search?q=          full-text search over heroes via OpenSearch
+  GET    /search?q=&team_id=&min_age=&max_age=    search heroes via OpenSearch
+  GET    /stats                    avg age per team via OpenSearch aggregation
 """
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException
 from opensearchpy import AsyncOpenSearch
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -86,6 +89,16 @@ class SearchHit(SQLModel):
     secret_name: str
     age: int | None
     team_id: int | None
+
+
+class TeamStat(SQLModel):
+    team_id: int
+    hero_count: int
+    avg_age: float | None
+
+
+class HeroCount(SQLModel):
+    count: int
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +195,17 @@ async def _os_delete(hero_id: int) -> None:
     )
 
 
+async def _os_bulk_index(heroes: list[Hero]) -> None:
+    body: list[dict[str, Any]] = []
+    for hero in heroes:
+        body.append({"index": {"_index": HERO_INDEX, "_id": hero.id}})
+        body.append(_hero_doc(hero))
+    resp = await os_client.bulk(body=body, params={"refresh": "wait_for"})
+    errors = [item for item in resp["items"] if "error" in item.get("index", {})]
+    if errors:
+        raise RuntimeError(f"OpenSearch bulk errors: {errors}")
+
+
 # ---------------------------------------------------------------------------
 # Team routes
 # ---------------------------------------------------------------------------
@@ -223,10 +247,29 @@ async def create_hero(
     return hero
 
 
+@app.post("/heroes/bulk", response_model=list[Hero], status_code=201)
+async def bulk_create_heroes(
+    data: Annotated[list[HeroCreate], Body()],
+    session: AsyncSession = Depends(get_session),
+) -> list[Hero]:
+    heroes = [Hero.model_validate(d) for d in data]
+    session.add_all(heroes)
+    await session.flush()   # populate auto-generated IDs before bulk index
+    await session.commit()
+    await _os_bulk_index(heroes)
+    return heroes
+
+
 @app.get("/heroes", response_model=list[Hero])
 async def list_heroes(session: AsyncSession = Depends(get_session)) -> list[Hero]:
     result = await session.execute(select(Hero).order_by(Hero.name))
     return list(result.scalars().all())
+
+
+@app.get("/heroes/count", response_model=HeroCount)
+async def count_heroes() -> HeroCount:
+    resp = await os_client.count(index=HERO_INDEX)
+    return HeroCount(count=resp["count"])
 
 
 @app.get("/heroes/{hero_id}", response_model=Hero)
@@ -279,23 +322,57 @@ async def delete_hero(
 
 
 @app.get("/search", response_model=list[SearchHit])
-async def search_heroes(q: str) -> list[SearchHit]:
+async def search_heroes(
+    q: str | None = None,
+    team_id: int | None = None,
+    min_age: int | None = None,
+    max_age: int | None = None,
+) -> list[SearchHit]:
+    must: list[dict[str, Any]] = (
+        [{"multi_match": {"query": q, "fields": ["name", "secret_name"]}}]
+        if q
+        else [{"match_all": {}}]
+    )
+    filters: list[dict[str, Any]] = []
+    if team_id is not None:
+        filters.append({"term": {"team_id": team_id}})
+    if min_age is not None or max_age is not None:
+        age_range: dict[str, int] = {}
+        if min_age is not None:
+            age_range["gte"] = min_age
+        if max_age is not None:
+            age_range["lte"] = max_age
+        filters.append({"range": {"age": age_range}})
+
+    resp = await os_client.search(
+        index=HERO_INDEX,
+        body={"query": {"bool": {"must": must, "filter": filters}}},
+    )
+    return [
+        SearchHit(id=hit["_id"], score=hit["_score"], **hit["_source"])
+        for hit in resp["hits"]["hits"]
+    ]
+
+
+@app.get("/stats", response_model=list[TeamStat])
+async def hero_stats() -> list[TeamStat]:
     resp = await os_client.search(
         index=HERO_INDEX,
         body={
-            "query": {
-                "multi_match": {
-                    "query": q,
-                    "fields": ["name", "secret_name"],
+            "size": 0,
+            "aggs": {
+                "by_team": {
+                    "terms": {"field": "team_id"},
+                    "aggs": {"avg_age": {"avg": {"field": "age"}}},
                 }
-            }
+            },
         },
     )
     return [
-        SearchHit(
-            id=hit["_id"],
-            score=hit["_score"],
-            **hit["_source"],
+        TeamStat(
+            team_id=bucket["key"],
+            hero_count=bucket["doc_count"],
+            avg_age=bucket["avg_age"]["value"],
         )
-        for hit in resp["hits"]["hits"]
+        for bucket in resp["aggregations"]["by_team"]["buckets"]
     ]
