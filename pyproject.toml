@@ -1,0 +1,11 @@
+[project]
+name = "async-db-example"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "opensearch-py[async]>=3.1.0",
+    "psycopg[binary,pool]>=3.3.3",
+    "sqlalchemy[asyncio]>=2.0.48",
+    "sqlmodel>=0.0.37",
+]
